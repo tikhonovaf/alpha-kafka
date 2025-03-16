@@ -1,0 +1,156 @@
+def UUID_DIR  = UUID.randomUUID().toString()
+def manifestName = 'manifest.json'
+def modules = [:]
+def repositorySettings
+
+node('mesos-platform') {
+    stage('define label') {
+        checkout scm
+
+        def gitURL = sh(returnStdout: true, script: 'git config remote.origin.url').trim()
+        echo "gitURL: $gitURL"
+
+        modules.registry = load "ufr-gradle-jenkinsfile/registry.groovy"
+        if (fileExists('./settings.groovy')) {
+            modules.settings = load "./settings.groovy"
+        }
+        else {
+            modules.settings = load "ufr-gradle-jenkinsfile/settings.groovy"    
+        }
+        modules.settings.init(modules.registry)
+
+        repositorySettings = modules.registry.ofRepository(gitURL)
+        echo "repositorySettings: ${repositorySettings.toString()}"
+    }
+}
+pipeline {
+    agent {
+        label {
+            label repositorySettings.javaVersion.label
+            customWorkspace UUID_DIR
+        }
+    }
+
+    parameters {
+        string(name: 'branch', description: 'branch to build', defaultValue: 'master')
+        string(name: 'task_id', description: 'task_id for tracing', defaultValue: '')
+        string(name: 'chain_id', description: 'chainId for fetch deployment info', defaultValue: '')
+        choice(name: 'artifact_target_type', choices: "RELEASE\nSNAPSHOT\nBUILD", description: '')
+        string(name: 'commit_from', description: 'start commit', defaultValue: '')
+        string(name: 'commit_to', description: 'end commit', defaultValue: '')
+    }
+
+    options {
+        skipStagesAfterUnstable()
+        timestamps()
+    }
+
+    stages {
+        stage('prepare') {
+            steps {
+                script {
+                    sh('chmod u+x gradlew')
+                    sh('java -version')
+                    sh('./gradlew --version')
+                }
+            }
+        }
+        stage('build') {
+            steps {
+                notifyBitbucketWithState 'INPROGRESS'
+                script {
+                    sh('./gradlew -s --no-daemon build -x test')
+                }
+            }
+        }
+        stage('unit test') {
+            steps {
+                script {
+                    sh('./gradlew -s --no-daemon test')
+                }
+            }
+        }
+        stage('sonarqube') {
+            steps {
+            withCredentials([string(credentialsId: 'sonar-token', variable: 'token')]) {
+                script {
+                    def projects = sh (script: './gradlew projects', returnStdout: true)
+                    def artifactName = (projects =~ /'(\w+-)+\w+'/)[0][0].replace("'", '')
+                    def branch = params.branch
+                    def sonarhost = 'https://sonarqube.moscow.alfaintra.net'
+                    sh("./gradlew -s --no-daemon -Dsonar.host.url=${sonarhost} -Dsonar.login=${token} -Dsonar.branch.name=${branch} -Dsonar.projectKey=${artifactName}  --info sonarqube")
+                }
+            }
+        }
+        }
+        stage('integration test') {
+            steps {
+                script {
+                    sh('./gradlew -s --no-daemon integrationTest')
+                }
+            }
+        }
+        stage('publish') {
+            when {
+                expression {
+                    params.artifact_target_type == 'RELEASE' || params.artifact_target_type == 'SNAPSHOT'
+                }
+            }
+            steps {
+                script {
+                    def version
+                    def lastCommitHash     = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    println("HEAD commit hash: ${lastCommitHash}")
+                    
+                    if (params.branch == 'master' && params.artifact_target_type == 'RELEASE') {
+                        version        = sh (script: './gradlew printReleaseVersion --quiet | tail -1', returnStdout: true).replace('\n', '')
+
+                        // publish git tag
+                        withCredentials([sshUserPrivateKey(
+                            credentialsId: 'jenkins-git',
+                            keyFileVariable: 'key')
+                        ]){
+                            String tag     = sh (script: "git tag -l '$version'", returnStdout: true).trim()
+                            sh (script: "git tag -a $version -m 'Tag release version'")
+                            sh (script: "eval `ssh-agent -s`; ssh-add $key; git push origin $version")
+					    }
+                    } else {
+                        version        = sh (script: './gradlew printVersion --quiet | tail -1', returnStdout: true).replace('\n', '') + "-${lastCommitHash}-${currentBuild.number}"
+                    }
+
+                    withCredentials([
+                                [
+                                    $class: 'UsernamePasswordMultiBinding',
+                                    credentialsId: 'jenkins-artifactory',
+                                    usernameVariable: 'USERNAME',
+                                    passwordVariable: 'PASSWORD'
+                                ]
+                            ]) {
+                    def username = env.USERNAME
+                    def password = env.PASSWORD
+                    sh("./gradlew -s --no-daemon artifactoryPublish -Pusername=${username} -Ppassword=${password} -Prelease.version=${version}")
+                  }
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            notifyBitbucketWithState 'FAILED'
+        }
+        success {
+            notifyBitbucketWithState 'SUCCESS'
+        }
+    }
+}
+
+def notifyBitbucketWithState(String state) {
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state  // Set result of currentBuild !Important!
+    }
+    notifyBitbucket()
+}
+
+def getCurrentTime() {
+    return java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd.HHmmss"))
+}

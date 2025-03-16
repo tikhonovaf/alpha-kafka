@@ -1,0 +1,301 @@
+def UUID_DIR  = UUID.randomUUID().toString()
+def manifestName = 'manifest.json'
+def modules = [:]
+def repositorySettings
+
+node('mesos-platform') {
+    stage('define label') {
+    checkout scm
+
+    def gitURL = sh(returnStdout: true, script: 'git config remote.origin.url').trim()
+    echo "gitURL: $gitURL"
+
+    modules.registry = load "ufr-gradle-jenkinsfile/registry.groovy"
+    if (fileExists('./settings.groovy')) {
+    modules.settings = load "./settings.groovy"
+    }
+    else {
+    modules.settings = load "ufr-gradle-jenkinsfile/settings.groovy"    
+    }
+    modules.settings.init(modules.registry)
+
+    repositorySettings = modules.registry.ofRepository(gitURL)
+    echo "repositorySettings: ${repositorySettings.toString()}"
+    }
+}
+pipeline {
+    agent {
+        label {
+            label repositorySettings.javaVersion.label
+            customWorkspace UUID_DIR
+        }
+    }
+
+    parameters {
+        string(name: 'branch', description: 'branch to build', defaultValue: 'master')
+        string(name: 'task_id', description: 'task_id for tracing', defaultValue: '')
+        string(name: 'chain_id', description: 'chainId for fetch deployment info', defaultValue: '')
+        choice(name: 'artifact_target_type', choices: "RELEASE\nSNAPSHOT\nBUILD", description: '')
+        string(name: 'commit_from', description: 'start commit', defaultValue: '')
+        string(name: 'commit_to', description: 'end commit', defaultValue: '')
+    }
+
+    options {
+        skipStagesAfterUnstable()
+        timestamps()
+    }
+
+    stages {
+        stage('prepare') {
+            steps {
+                script {
+                    sh('chmod u+x gradlew')
+                    sh('java -version')
+                    sh('./gradlew --version')
+                }
+            }
+        }
+        stage('build') {
+            steps {
+                notifyBitbucketWithState 'INPROGRESS'
+                script {
+                    sh('./gradlew -s --no-daemon build -x test -x integrationTest')
+                }
+            }
+        }
+        stage('unit test') {
+            steps {
+                script {
+                    sh('./gradlew -s --no-daemon test')
+                }
+            }
+        }
+        stage('integration test') {
+            steps {
+                script {
+                    sh('./gradlew -s --no-daemon integrationTest')
+                }
+            }
+        }
+        stage('sonarqube') {
+            steps {
+            withCredentials([string(credentialsId: 'sonar-token', variable: 'token')]) {
+                script {
+                    def artifactName
+                    try {
+                        def gradleSettings = readProperties file: 'settings.gradle'
+                        artifactName = (gradleSettings =~ "rootProject\\.name:'([^']+)")[0][1]
+                    } catch (Exception e) {
+                        echo "Failed. Unable to get rootProject.name from settings.gradle file: ${e}"
+                    }
+                    if (artifactName == null || artifactName.isEmpty()) {
+                        def projects = sh (script: './gradlew projects', returnStdout: true)
+                        artifactName = (projects =~ /'(\w+-)+\w+'/)[0][0].replace("'", '')
+                    }
+                    def branch = params.branch
+                    def sonarhost = 'https://sonarqube.moscow.alfaintra.net'
+                    sh("./gradlew -s --no-daemon -Dsonar.host.url=${sonarhost} -Dsonar.login=${token} -Dsonar.branch.name=${branch} -Dsonar.projectKey=${artifactName}  --info sonarqube")
+                }
+            }
+        }
+        }
+        stage("read platform configs") {
+            when {
+                expression {
+                    params.artifact_target_type == 'RELEASE' || params.artifact_target_type == 'SNAPSHOT'
+                }
+            }
+            steps { // Дополненный общий подход предполагается такой: если документация у нас не в байнари, то указывай ссылку на неё в файл, если у тебя дока в байнари, то можно и не создавать файл в проекте, т.к. мы знаем где байнари
+                script {
+                    if (fileExists('./platform-config.yml')) {
+                        println("./platform-config.yml found. Using props from it")
+                        def configVal = readYaml file: "platform-config.yml"
+                        docsType = configVal.docs_type
+                        echo "configVal=$configVal"
+                        propUrl = configVal.'properties'.'platform.docs-link'.toString().replace("[","").replace("]","")
+                    }
+                    else { // этого шага нет в общих рекомендациях документации, но он позволит не создавать файл, который содержит просто ссылку на байнари, которую мы и так знаем.
+                        println("./platform-config.yml not found. Using default props to binary")
+                        propUrl = "http://binary/artifactory"
+                        docsType = "ascii"
+                    }
+                }
+            }
+        }
+        stage('publish') {
+            when {
+                expression {
+                    params.artifact_target_type == 'RELEASE' || params.artifact_target_type == 'SNAPSHOT'
+                }
+            }
+            steps {
+                script {
+                    packageName        = sh(returnStdout: true, script: './gradlew -s --quiet properties | grep "^name: "').trim().replace("name: ", "")
+                    println("Package name: ${packageName}")
+
+                    def repository, version, docsRepo
+                    def lastCommitHash     = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    println("HEAD commit hash: ${lastCommitHash}")
+
+                    if (params.branch == 'master' && params.artifact_target_type == 'RELEASE') {
+                        repository     = "ufr-docker-releases"
+                        docsRepo       = "eco-mvn-releases"
+                        version        = sh (script: './gradlew printReleaseVersion --quiet | tail -1', returnStdout: true).replace('\n', '')
+
+                        // publish git tag
+                        withCredentials([sshUserPrivateKey(
+                            credentialsId: 'jenkins-git',
+                            keyFileVariable: 'key')
+                        ]){
+                            String tag     = sh (script: "git tag -l '$version'", returnStdout: true).trim()
+                            sh (script: "git tag -a $version -m 'Tag release version'")
+                            sh (script: "eval `ssh-agent -s`; ssh-add $key; git push origin $version")
+					    }
+
+                    } else {
+                        repository     = "ufr-docker-snapshots"
+                        docsRepo       = "eco-mvn-snapshots"
+                        version        = sh (script: './gradlew printVersion --quiet | tail -1', returnStdout: true).replace('\n', '') + "-${lastCommitHash}-${currentBuild.number}"
+                    }
+                  
+                    registry           = "${repository}.binary.alfabank.ru"
+                    group              = "ru/alfabank/${packageName}"
+                  
+                    def imageFullName  = "${registry}/${packageName}:${version}"
+                    println("Image full name: ${imageFullName}")
+
+                    def server, rtDocker, docsDir, docsGroup, docsFile, indexPagePath
+                    def buildInfo = Artifactory.newBuildInfo()
+
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId   : 'jenkins-artifactory',
+                            usernameVariable: 'USERNAME',
+                            passwordVariable: 'PASSWORD'
+                        )
+                    ]) {
+                        def username = env.USERNAME
+                        def password = env.PASSWORD
+
+                        server    = Artifactory.newServer url: "http://binary/artifactory", username: "${username}", password: "${password}"
+                        rtDocker  = Artifactory.docker server: server
+
+                        sh("echo $PASSWORD | docker login -u $USERNAME --password-stdin $registry")
+
+                        sh("./gradlew dockerCreateDockerfile");
+                        sh("docker build -t ${imageFullName} -f build/docker/Dockerfile build/docker")
+
+                        sh("curl -Lo /var/lib/jenkins/.bin/jfrog --create-dirs http://binary/artifactory/banksoft/jfrog/jfrog")
+                        sh("chmod +x /var/lib/jenkins/.bin/jfrog")
+
+                        sh("/var/lib/jenkins/.bin/jfrog rt c binary --url=http://binary/artifactory --user=${username} --password=${password}")
+
+                        docsDir = sh(returnStdout: true, script: './gradlew -s --quiet properties | grep "^docsDir: "').trim().replace("docsDir: ", "")
+
+                        if (fileExists(docsDir)) {
+                            docsGroup = sh(returnStdout: true, script: './gradlew -s --quiet properties | grep "^group: "').trim().replace("group: ", "").replace(".", "/")
+                            try{
+                                echo "Archiving docs"
+                                zip zipFile: "${packageName}-${version}-docs.zip", archive: false, dir: './build/docs/'
+                                archiveArtifacts artifacts: "${packageName}-${version}-docs.zip", fingerprint: true
+                                }
+                            catch (err) {
+                                echo 'Archiving failed. Something went wrong'
+                            }
+                            echo "Pushing docs"
+                            docsFile = sh(script: 'ls *-docs.zip', returnStdout: true).trim()
+                            sh("/var/lib/jenkins/.bin/jfrog rt u ${docsFile} ${docsRepo}/${docsGroup}/${packageName}/docs/${version}/")
+                        } else {
+                            echo "Docs is not found"
+                        }
+                    }
+
+                    url = sh(returnStdout: true, script: 'git config remote.origin.url').trim()
+                    commit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+
+                    if (docsType == "ascii") {
+                        if (docsGroup == null) { // В проекте вовсе нет документации, т.к. тип ascii мы поставили по умолчанию, т.к. не нашли platform-config.yml, но настроек документации в проекте не обнаружили
+                            documentLink = "https://git.moscow.alfaintra.net/projects/UFRSANDBOX/repos/ufr-gradle-jenkinsfile/browse/README.md" // даем ссылку на README.md, где описано как настроить ссылку на документацию.
+                        } else { // Собираем ссылку на index.html в архиве.
+                            indexPagePath = "asciidoc/index.html" // Не даем гибкости. От всех ожидаем одинаковую структуру директорий документации в итоговом архиве
+                            documentLink = "${propUrl}/${docsRepo}/${docsGroup}/${packageName}/docs/${version}/${docsFile}!/${indexPagePath}"
+                        }
+                    } else { // Предполагается, что если ссылка не на binary, то в файле её указали целиком
+                        documentLink = "${propUrl}"
+                    }
+
+                    commonProps = "version=${version};" +
+                                  "Module-Origin=${url};" +
+                                  "platform.deployment.app-name=${packageName};" +
+                                  "platform.artifact.name=${packageName};" +
+                                  "platform.artifact-type=service;" +
+                                  "platform.artifact.group=${group.replace('/', '.')};" +
+                                  "platform.deployment.id=${registry}/${packageName};" +
+                                  "platform.template.id=ru.alfabank.template.template-ufr-api;" +
+                                  "platform.service.id=${registry}/${packageName};" +
+                                  "platform.git.branch=${params.branch};" +
+                                  "platform.git.repo-url=${url};" +
+                                  "platform.git.commit-id=${commit};" +
+                                  "vcs.revision=${lastCommitHash};" +
+                                  "platform.docs-link=${documentLink};" +
+                                  "platform.label="
+
+                    rtProps = commonProps + "API"
+                    rtDocsProps = commonProps + "DOC"
+
+                    buildInfo = rtDocker.push "${imageFullName}", "${repository}"
+                    server.publishBuildInfo buildInfo
+
+                    // Добавляем платформенные property к артефакту в binary для образа
+                    sh("/var/lib/jenkins/.bin/jfrog rt sp \"${repository}/${packageName}/${version}/${manifestName}\" \"${rtProps}\"")
+                    // Добавляем платформенные property к артефакту в binary для архива документации. Если архива нет, то ошибки не будет, просто вхолостую че-то поделаем.
+                    sh("/var/lib/jenkins/.bin/jfrog rt sp \"${docsRepo}/${docsGroup}/${packageName}/docs/${version}/*docs.zip\"  \"${rtDocsProps}\"")
+
+                    def dockerImageDigest = getDockerImageDigest(imageFullName, registry, packageName)
+                    echo "dockerImageDigest: $dockerImageDigest"
+
+                    sh (script: "docker image rm '$imageFullName'")
+                    sh (script: 'git checkout .')
+                    sh (script: 'git clean -d -f')
+
+                    def sha1sum = sh(script: "curl -s http://binary/artifactory/$repository/$packageName/$version/$manifestName | sha1sum | awk '{print \$1}'", returnStdout: true).trim()
+                    echo "Manifest checksum $sha1sum"
+
+                    currentBuild.description = "artifact_app_sha1:$sha1sum"
+                    currentBuild.description += "\ndockerImageDigest:$dockerImageDigest"
+                    currentBuild.description += "\nversion:$version"
+                    currentBuild.description += "\nserviceName:$packageName"
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            notifyBitbucketWithState 'FAILED'
+        }
+        success {
+            notifyBitbucketWithState 'SUCCESS'
+        }
+    }
+}
+
+def getDockerImageDigest(
+    String imageFullName,
+    String registry,
+    String packageName
+    ){
+        return sh (returnStdout: true, script: "docker inspect --format='{{index .RepoDigests 0}}' $imageFullName")
+            .trim()
+            .replace("$registry/$packageName" + "@", "")
+    }
+
+def notifyBitbucketWithState(String state) {
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state  // Set result of currentBuild !Important!
+    }
+    notifyBitbucket()
+}
+
+def getCurrentTime() {
+    return java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd.HHmmss"))
+}

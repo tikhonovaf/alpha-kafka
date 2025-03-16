@@ -1,0 +1,17 @@
+spring:
+  application.name: ufr-onespace-kafka-api
+  profiles.active: local
+  cloud:
+    config:
+      uri: "http://${SERVICE_HOST}/${PROJECT_KEY}-settings"
+      enabled: true
+      failFast: true
+  zipkin:
+    enabled: false
+
+---
+spring:
+  profiles: local, test
+  cloud:
+    config:
+      enabled: false

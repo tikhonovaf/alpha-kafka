@@ -1,0 +1,13 @@
+SERVICE_NAME: ufr-onespace-kafka-api
+
+logging:
+  config: classpath:logback-spring.xml
+
+
+alfalab:
+  logging:
+    http:
+      servlet:
+        extended-logging-enabled: true
+
+exponential-retry: false

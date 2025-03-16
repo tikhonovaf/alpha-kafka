@@ -1,0 +1,126 @@
+SERVICE_NAME: ufr-onespace-kafka-api
+
+logging:
+  config: classpath:logback-spring.xml
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'
+      base-path: /admin
+  server.ssl.enabled: false
+health.config.enabled: false
+
+spring:
+  kafka:
+    producer:
+      bootstrap-servers: "localhost:9092"
+      key-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    topic:
+      name: ONESPACE_TMFLBR_TEST
+  common-bank-kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: SFACALL_UFRVOE_VOE_SURVEY_PUSH_FOR_SFACALL_TEST
+      properties:
+        spring.json.trusted.packages: ru.alfabank.ufr.onespace.kafka.model
+        auto.offset.reset: earliest
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    properties:
+      security.protocol: PLAINTEXT
+      sasl.mechanism:
+      sasl.jaas.config:
+      ssl.endpoint.identification.algorithm:
+      ssl.truststore.location:
+      ssl.truststore.password:
+    allow-mock-rest: false
+    enable-consumer: true
+    topics:
+      voe-survey:
+        name: UFRVOE_VOE_SURVEY_PUSH_FOR_SFACALL_TEST
+  mlm-kafka:
+    producer:
+      bootstrap-servers: "localhost:9092"
+      key-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    topic:
+      name: SFACALL_MLMCALL_INFO_TEST
+  sleuth:
+    enabled: ${TRACING_ENABLED:false}
+    propagation.type: w3c
+    traceId128: true
+    supportsJoin: false
+    otel:
+      exporter.otlp.endpoint: http://localhost:4317
+      config.trace-id-ratio-based: 1.0
+      multiple-tracer-configs-detector-enabled: false
+
+alfalab:
+  logging:
+    http:
+      servlet:
+        extended-logging-enabled: true
+
+exponential-retry: true
+
+interaction:
+  hazelcast:
+    enabled: true
+    login: onespace
+    hosts:
+      - ekcdevdata1:5720
+      - ekcdevdata2:5720
+      - ekcdevdata3:5720
+    entities:
+      maps:
+        default:
+          name: default
+          locktime:
+            unit: minutes
+            value: 1
+          lifetime:
+            unit: hours
+            value: 1
+      topics:
+        default:
+          name: default
+          configRingbuffer: true
+          capacity: 100
+          topicOverloadPolicy: DISCARD_OLDEST
+          lifetime:
+            unit: seconds
+            value: 5
+        voe-survey:
+          name: VOE_SURVEY_FOR_SFACALL
+          configRingbuffer: true
+          capacity: 10000
+          topicOverloadPolicy: BLOCK
+          lifetime:
+            unit: seconds
+            value: 300
+
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+
+interaction:
+  hazelcast:
+    enabled: false
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+  common-bank-kafka:
+    allow-mock-rest: true
+
+interaction:
+  hazelcast:
+    enabled: false
